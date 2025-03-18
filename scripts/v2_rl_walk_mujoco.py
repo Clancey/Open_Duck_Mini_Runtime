@@ -1,5 +1,6 @@
 import time
 import pickle
+from oclock import Timer
 
 import numpy as np
 
@@ -62,6 +63,8 @@ class RLWalk:
         self.control_freq = control_freq
         self.pid = pid
 
+        self.timer = Timer(interval=1.0 / self.control_freq, warnings=True)
+
         # self.saved_obs = []
 
         self.replay_obs = replay_obs
@@ -80,7 +83,9 @@ class RLWalk:
         self.start()
 
         self.imu = Imu(
-            sampling_freq=int(self.control_freq), user_pitch_bias=self.pitch_bias, upside_down=False
+            sampling_freq=int(self.control_freq),
+            user_pitch_bias=self.pitch_bias,
+            upside_down=False,
         )
 
         self.eyes = Eyes()
@@ -220,12 +225,16 @@ class RLWalk:
                 X_pressed = False
                 left_trigger = 0
                 right_trigger = 0
-                t = time.time()
+                # t = time.time()
 
                 if self.commands:
-                    self.last_commands, A_pressed, X_pressed, left_trigger, right_trigger = (
-                        self.xbox_controller.get_last_command()
-                    )
+                    (
+                        self.last_commands,
+                        A_pressed,
+                        X_pressed,
+                        left_trigger,
+                        right_trigger,
+                    ) = self.xbox_controller.get_last_command()
 
                 if X_pressed:
                     self.sounds.play_random_sound()
@@ -294,14 +303,16 @@ class RLWalk:
 
                 i += 1
 
-                took = time.time() - t
-                # print("Full loop took", took, "fps : ", np.around(1 / took, 2))
-                if (1 / self.control_freq - took) < 0:
-                    print(
-                        "Policy control budget exceeded by",
-                        np.around(took - 1 / self.control_freq, 3),
-                    )
-                time.sleep(max(0, 1 / self.control_freq - took))
+                self.timer.checkpt()
+
+                # took = time.time() - t
+                # # print("Full loop took", took, "fps : ", np.around(1 / took, 2))
+                # if (1 / self.control_freq - took) < 0:
+                #     print(
+                #         "Policy control budget exceeded by",
+                #         np.around(took - 1 / self.control_freq, 3),
+                #     )
+                # time.sleep(max(0, 1 / self.control_freq - took))
 
         except KeyboardInterrupt:
             # self.hwi.freeze()
