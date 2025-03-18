@@ -67,6 +67,7 @@ class RLWalk:
         self.pid = pid
 
         # self.timer = Timer(interval=1.0 / self.control_freq, warnings=True)
+        schedule(self._run, interval=1.0 / self.control_freq)
 
         # self.saved_obs = []
 
@@ -221,7 +222,6 @@ class RLWalk:
     def run(self):
         run_loop()
 
-    @schedule(interval=1.0 / 50)
     def _run(self):
         i = 0
         try:
