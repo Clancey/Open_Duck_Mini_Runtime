@@ -1,6 +1,9 @@
 import time
 import pickle
-from oclock import Timer
+
+# from oclock import Timer
+from ischedule import schedule, run_loop
+
 
 import numpy as np
 
@@ -63,7 +66,7 @@ class RLWalk:
         self.control_freq = control_freq
         self.pid = pid
 
-        self.timer = Timer(interval=1.0 / self.control_freq, warnings=True)
+        # self.timer = Timer(interval=1.0 / self.control_freq, warnings=True)
 
         # self.saved_obs = []
 
@@ -216,6 +219,10 @@ class RLWalk:
         time.sleep(2)
 
     def run(self):
+        run_loop()
+
+    @schedule(interval=1.0 / 50)
+    def _run(self):
         i = 0
         try:
             print("Starting")
@@ -303,7 +310,7 @@ class RLWalk:
 
                 i += 1
 
-                self.timer.checkpt()
+                # self.timer.checkpt()
 
                 # took = time.time() - t
                 # # print("Full loop took", took, "fps : ", np.around(1 / took, 2))
