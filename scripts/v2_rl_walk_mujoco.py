@@ -80,7 +80,9 @@ class RLWalk:
         self.start()
 
         self.imu = Imu(
-            sampling_freq=int(self.control_freq), user_pitch_bias=self.pitch_bias, upside_down=False
+            sampling_freq=int(self.control_freq),
+            user_pitch_bias=self.pitch_bias,
+            upside_down=False,
         )
 
         self.eyes = Eyes()
@@ -125,6 +127,11 @@ class RLWalk:
         if not self.standing:
             self.PRM = PolyReferenceMotion("./polynomial_coefficients.pkl")
             self.imitation_i = 0
+
+        self.history_len = 3
+        self.obs_size_for_history = 57
+
+        self.obs_history = np.zeros(self.history_len * self.obs_size_for_history)
 
     def add_fake_head(self, pos):
         # add just the antennas now
@@ -191,12 +198,27 @@ class RLWalk:
                 dof_pos - self.init_pos,
                 dof_vel * 0.05,
                 self.last_action,
-                self.last_last_action,
-                self.last_last_last_action,
+                # self.last_last_action,
+                # self.last_last_last_action,
                 feet_contacts,
                 ref,
+                self.obs_history,
             ]
         )
+
+        obs_for_history = np.concatenate(
+            [
+                imu_data["gyro"],
+                imu_data["accelero"],
+                cmds,
+                dof_pos - self.init_pos,
+                dof_vel * 0.05,
+                self.last_action,
+                feet_contacts,
+            ]
+        )
+        self.obs_history = np.roll(self.obs_history, self.obs_size_for_history)
+        self.obs_history[: self.obs_size_for_history] = obs_for_history
 
         return obs
 
@@ -223,9 +245,13 @@ class RLWalk:
                 t = time.time()
 
                 if self.commands:
-                    self.last_commands, A_pressed, X_pressed, left_trigger, right_trigger = (
-                        self.xbox_controller.get_last_command()
-                    )
+                    (
+                        self.last_commands,
+                        A_pressed,
+                        X_pressed,
+                        left_trigger,
+                        right_trigger,
+                    ) = self.xbox_controller.get_last_command()
 
                 if X_pressed:
                     self.sounds.play_random_sound()
