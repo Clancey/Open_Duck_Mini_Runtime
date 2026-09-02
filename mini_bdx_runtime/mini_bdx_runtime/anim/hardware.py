@@ -84,6 +84,11 @@ class SensorSnapshot:
     joint_velocities: np.ndarray            # (14,) rad/s, bus order
     tilt_rad: float                         # roll/pitch magnitude from vertical
     feet_contacts: np.ndarray               # (2,) [left, right] in {0,1}
+    # Whether ``tilt_rad`` reflects a real tilt measurement. False means the IMU
+    # was unavailable and ``tilt_rad`` is a zero placeholder — it must NOT be
+    # trusted as "upright". Balancing modes (STAND/WALK) require this True; the
+    # non-balancing DOCK_DEMO / head-only path may run with it False.
+    tilt_valid: bool = True
     gyro: np.ndarray = field(default_factory=lambda: np.zeros(3))
     accelero: np.ndarray = field(default_factory=lambda: np.zeros(3))
     temperatures_c: Optional[np.ndarray] = None   # (14,) or None if unsupported
@@ -168,6 +173,7 @@ class MockRobot(RobotInterface):
         self.target_history: List[np.ndarray] = []
         self.antenna_history: List[Tuple[float, float]] = []
         self.eye_history: List[int] = []
+        self.eye_event_history: List[str] = []
         self.sound_history: List[str] = []
         self.projector_state: bool = False
         self.projector_history: List[bool] = []
@@ -208,6 +214,9 @@ class MockRobot(RobotInterface):
 
     def set_eyes(self, state: int) -> None:
         self.eye_history.append(int(state))
+
+    def set_eye_event(self, value: str) -> None:
+        self.eye_event_history.append(str(value))
 
     def play_sound(self, name: str) -> None:
         self.sound_history.append(str(name))

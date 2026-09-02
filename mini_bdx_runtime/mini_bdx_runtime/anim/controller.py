@@ -467,10 +467,16 @@ class AnimationController:
         out.antennas = (float(slewed[0]), float(slewed[1]))
         # Eyes.
         self.robot.set_eyes(int(show.eyes))
-        # Discrete events -> sounds / projector (never rate-limited).
+        # Discrete events -> sounds / projector / eyes (never rate-limited).
         for ev in show.events:
             if ev.type == "sound":
                 self.robot.play_sound(ev.value)
             elif ev.type == "projector":
                 self.robot.set_projector(ev.value in ("on", "1", "true", "True"))
+            elif ev.type == "eye":
+                # Expressive eye cue (wide/blink/happy). Optional on the robot
+                # interface: only RealRobot implements it, mocks simply skip.
+                fn = getattr(self.robot, "set_eye_event", None)
+                if fn is not None:
+                    fn(ev.value)
             out.events_fired.append(ev)

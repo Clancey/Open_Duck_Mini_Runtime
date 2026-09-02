@@ -83,11 +83,50 @@ class _SpyDuckConfig:
 
 
 class _SpyEyes:
+    """Models the eye device's pin lifecycle.
+
+    The real bug (#1) was ``connect()`` calling ``stop()``, whose ``deinit()``
+    killed the pins so every later write silently failed. Here ``stop()`` marks
+    the device unusable and any subsequent cue raises — exactly what a write to a
+    deinitialised pin does — so a ``connect()`` that stops the eyes is detectable.
+    """
+
     def __init__(self):
+        self.usable = True
         self.stopped = False
+        self.authored = []          # note_authored() history (per-frame channel)
+        self.cues = []              # expressive cue history (blink/double/hold)
+
+    def _require_usable(self):
+        if not self.usable:
+            raise RuntimeError("eye pins deinitialised (stop() was called)")
+
+    def note_authored(self, state):
+        self._require_usable()
+        self.authored.append(int(state))
+
+    def blink(self, n=1):
+        self._require_usable()
+        self.cues.append(("blink", int(n)))
+
+    def double_blink(self):
+        self._require_usable()
+        self.cues.append(("double_blink", None))
+
+    def hold_open(self, seconds=1.0):
+        self._require_usable()
+        self.cues.append(("hold_open", float(seconds)))
 
     def stop(self):
         self.stopped = True
+        self.usable = False
+
+
+class _SpyImuUnavailable:
+    """An IMU whose constructor fails, as when I2C is disabled on the Pi."""
+
+    def __init__(self, sampling_freq=50):
+        raise RuntimeError("No Hardware I2C on (scl,sda)=(3,2)")
 
 
 class _SpySounds:
@@ -181,3 +220,89 @@ def test_enable_antennas_false_never_energises(fake_hw):
     robot.set_antennas(0.9, -0.9)
     assert robot.antennas is None
     assert _SpyAntennas.instances == 0
+
+
+# --- eyes: connect must leave the eye device USABLE (regression for bug #1) ---
+def test_connect_leaves_eyes_usable_not_deinitialised(fake_hw):
+    """connect() used to build Eyes() then immediately stop() it, which
+    deinitialised the GPIO pins; every later set_eyes() then wrote to dead pins
+    and the swallowed exception meant the eyes never lit. connect() must now
+    leave the eye device alive so the per-frame eye channel reaches hardware."""
+    robot = _make()
+    robot.connect()
+    assert robot.eyes is not None
+    assert robot.eyes.usable is True          # pins NOT deinitialised by connect
+    assert robot.eyes.stopped is False        # background blink thread not stopped
+    # An authored eye channel (1->0 edge) actually reaches the live device.
+    robot.set_eyes(1)
+    robot.set_eyes(0)
+    assert robot.eyes.authored == [1, 0]
+
+
+def test_set_eye_event_maps_cues_to_hardware(fake_hw):
+    """Expressive clip eye cues reach the device with the right mapping."""
+    robot = _make()
+    robot.connect()
+    robot.set_eye_event("wide")
+    robot.set_eye_event("happy")
+    robot.set_eye_event("blink")
+    assert robot.eyes.cues == [
+        ("hold_open", 1.0),
+        ("double_blink", None),
+        ("blink", 1),
+    ]
+
+
+# --- IMU optional for dock/head, but tilt marked invalid (safety) -----------
+def test_connect_tolerates_missing_imu(fake_hw, monkeypatch):
+    """A robot with I2C disabled (no BNO055) must still connect for the dock /
+    head-only path: connect() degrades to self.imu = None with a warning."""
+    import types
+    m = types.ModuleType("mini_bdx_runtime.raw_imu")
+    m.Imu = _SpyImuUnavailable
+    monkeypatch.setitem(sys.modules, "mini_bdx_runtime.raw_imu", m)
+    robot = _make()
+    robot.connect()
+    assert robot.imu is None
+
+
+def test_read_reports_tilt_invalid_without_imu(fake_hw, monkeypatch):
+    """Without an IMU, read() falls back to zero tilt but MUST flag it invalid
+    so the FSM cannot mistake the placeholder 0.0 for 'upright' and walk blind."""
+    import types
+    m = types.ModuleType("mini_bdx_runtime.raw_imu")
+    m.Imu = _SpyImuUnavailable
+    monkeypatch.setitem(sys.modules, "mini_bdx_runtime.raw_imu", m)
+    robot = _make()
+    robot.connect()
+
+    class _PosHWI:
+        def get_present_positions(self):
+            return np.zeros(14)
+
+        def get_present_velocities(self):
+            return np.zeros(14)
+    robot.hwi = _PosHWI()
+    from mini_bdx_runtime.anim.hardware import OperatorInput
+    snap = robot.read(OperatorInput())
+    assert snap is not None
+    assert snap.tilt_rad == 0.0
+    assert snap.tilt_valid is False
+
+
+def test_read_reports_tilt_valid_with_imu(fake_hw):
+    """With a working IMU, read() reports tilt_valid=True."""
+    robot = _make()
+    robot.connect()
+
+    class _PosHWI:
+        def get_present_positions(self):
+            return np.zeros(14)
+
+        def get_present_velocities(self):
+            return np.zeros(14)
+    robot.hwi = _PosHWI()
+    from mini_bdx_runtime.anim.hardware import OperatorInput
+    snap = robot.read(OperatorInput())
+    assert snap is not None
+    assert snap.tilt_valid is True

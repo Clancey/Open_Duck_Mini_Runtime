@@ -114,18 +114,27 @@ class RealRobot(RobotInterface):
         self._actuate = bool(actuate)
         cfg = self._duck_config or DuckConfig()
         self.hwi = HWI(cfg, self.usb_port)
-        self.imu = Imu(sampling_freq=50)
+        # The IMU is required for balance (STAND/WALK) but not for the dock demo
+        # (legs are simply held at init_pos). If the IMU can't be constructed —
+        # e.g. I2C is disabled on the host — degrade gracefully: ``read`` already
+        # falls back to a zero gyro/accel snapshot (tilt=0). This keeps the
+        # head-animation / dock path usable on a bench without an IMU. STAND/WALK
+        # must NOT be entered with ``self.imu is None`` (no balance feedback).
+        try:
+            self.imu = Imu(sampling_freq=50)
+        except Exception as err:
+            self.imu = None
+            print("[RealRobot] WARNING: IMU unavailable (%s) — running without "
+                  "balance sensing. Dock/head-only OK; do NOT stand or walk." % err)
         # NOTE: antennas are intentionally NOT constructed here (see class /
         # set_antennas docstrings) — building Antennas() twitches the servos.
         if self._enable_eyes:
             from mini_bdx_runtime.eyes import Eyes
+            # Eyes own a background idle-blink thread; expressive clip eye cues
+            # override it via set_eyes / set_eye_event. (Previously the thread was
+            # stopped here, which also deinitialised the pins and left the eyes
+            # dark — the animation eye track never reached the hardware.)
             self.eyes = Eyes()
-            # Take exclusive control of the eye pins: stop the auto-blink thread
-            # so the animation eye track is authoritative.
-            try:
-                self.eyes.stop()
-            except Exception:
-                pass
         if self._enable_sounds:
             from mini_bdx_runtime.sounds import Sounds
             self.sounds = Sounds(volume=1.0, sound_directory=self._sound_directory)
@@ -142,6 +151,11 @@ class RealRobot(RobotInterface):
         vel = self.hwi.get_present_velocities()
         if vel is None or len(vel) != N_DOFS:
             vel = np.zeros(N_DOFS, dtype=np.float64)
+        # Tilt is only meaningful if the IMU is present AND this read succeeded.
+        # With no IMU (self.imu is None) get_data() raises and we fall back to a
+        # zero snapshot — tilt_rad=0 then does NOT mean "upright", so mark it
+        # invalid so the FSM refuses to enter/stay in a balancing mode on it.
+        tilt_valid = self.imu is not None
         try:
             imu_data = self.imu.get_data()
             accel = np.asarray(imu_data["accelero"], dtype=np.float64)
@@ -149,12 +163,14 @@ class RealRobot(RobotInterface):
         except Exception:
             accel = np.zeros(3)
             gyro = np.zeros(3)
+            tilt_valid = False
         tilt = _tilt_from_accel(accel)
         return SensorSnapshot(
             t_monotonic=time.monotonic(),
             joint_positions=np.asarray(pos, dtype=np.float64),
             joint_velocities=np.asarray(vel, dtype=np.float64),
             tilt_rad=tilt,
+            tilt_valid=tilt_valid,
             # No dedicated foot-contact sensor on this build; DOCK_DEMO holds the
             # legs, so we report "both feet" (the dock supports the robot). This
             # is only consumed by the STAND/dock-handoff guard, which the demo
@@ -210,10 +226,36 @@ class RealRobot(RobotInterface):
         self.antennas.set_position_right(float(right_norm))
 
     def set_eyes(self, state: int) -> None:
+        """Route the per-frame authored eye channel to the eyes. Baseline
+        lighting + idle blinking are owned by the Eyes background thread; a
+        1->0 edge in the authored channel is treated as an authored blink so a
+        clip with a steady/absent eye channel does not force the eyes dark."""
         if self.eyes is None:
             return
         try:
-            self.eyes._set_eyes(bool(state))
+            self.eyes.note_authored(int(state))
+        except Exception:
+            pass
+
+    def set_eye_event(self, value: str) -> None:
+        """Apply a discrete expressive eye cue from a clip show event.
+
+        Maps the authored cue vocabulary onto the on/off LED hardware:
+        ``blink`` -> one blink, ``happy`` -> quick double-blink, ``wide`` /
+        ``startle`` -> hold the eyes wide (suppress blinking) briefly. Unknown
+        cues fall back to a single blink."""
+        if self.eyes is None:
+            return
+        v = str(value).lower()
+        try:
+            if v in ("wide", "startle", "alert", "open"):
+                self.eyes.hold_open(1.0)
+            elif v in ("happy", "double", "double_blink"):
+                self.eyes.double_blink()
+            elif v in ("blink", "close", "closed"):
+                self.eyes.blink()
+            else:
+                self.eyes.blink()
         except Exception:
             pass
 

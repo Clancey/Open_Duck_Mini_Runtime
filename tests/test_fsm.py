@@ -11,14 +11,14 @@ INIT = np.array([0.002, 0.053, -0.63, 1.368, -0.784, 0.0, 0.0, 0.0, 0.0,
                  -0.003, -0.065, 0.635, 1.379, -0.796])
 
 
-def snap(t, pos, vel=0.0, tilt=0.0, feet=(1.0, 1.0), **op):
+def snap(t, pos, vel=0.0, tilt=0.0, feet=(1.0, 1.0), tilt_valid=True, **op):
     pos = np.asarray(pos, dtype=float)
     if np.isscalar(vel):
         vel = np.full(14, vel, dtype=float)
     return SensorSnapshot(
         t_monotonic=t, joint_positions=pos,
         joint_velocities=np.asarray(vel, dtype=float), tilt_rad=tilt,
-        feet_contacts=np.asarray(feet, dtype=float),
+        feet_contacts=np.asarray(feet, dtype=float), tilt_valid=tilt_valid,
         operator=OperatorInput(**op),
     )
 
@@ -234,3 +234,53 @@ def test_engine_mode_none_in_nonoperational_states():
     assert fsm.engine_mode() is None          # ARMING
     fsm.to_fault("x")
     assert fsm.engine_mode() is None          # FAULT
+
+
+# --- IMU-optional safety: balancing modes require valid tilt sensing ---------
+# The dock/head-only path may run with the IMU absent (tilt_valid=False, a zero
+# placeholder tilt). STAND and WALK must NEVER proceed on that fake tilt.
+def test_arming_to_stand_blocked_without_valid_tilt():
+    fsm = make()
+    t = arm_to_ready(fsm)                 # armed, holding, valid tilt
+    assert fsm.state == FSMState.ARMING
+    # Operator asks to leave the dock for STAND, but the IMU is unavailable.
+    fsm.update(snap(t + 0.02, INIT, tilt_valid=False, offdock_confirmed=True), INIT)
+    assert fsm.state == FSMState.FAULT
+    assert "IMU" in fsm.fault_reason or "tilt" in fsm.fault_reason
+
+
+def test_arming_to_dock_allowed_without_valid_tilt():
+    """DOCK_DEMO is non-balancing: entering it with no IMU is allowed."""
+    fsm = make()
+    t = arm_to_ready(fsm)
+    assert fsm.state == FSMState.ARMING
+    fsm.update(snap(t + 0.02, INIT, tilt_valid=False, dock_confirmed=True), INIT)
+    assert fsm.state == FSMState.DOCK_DEMO
+
+
+def test_stand_faults_if_tilt_becomes_invalid():
+    fsm = make()
+    t = arm_to_ready(fsm, offdock_confirmed=True)
+    assert fsm.state == FSMState.STAND
+    # IMU drops out mid-stand -> tilt is no longer trustworthy -> FAULT.
+    fsm.update(snap(t + 0.02, INIT, tilt_valid=False), INIT)
+    assert fsm.state == FSMState.FAULT
+
+
+def test_walk_faults_if_tilt_becomes_invalid():
+    fsm = make()
+    t = arm_to_ready(fsm, offdock_confirmed=True)
+    t = _drive(fsm, t, 2, INIT, locomotion_command=(0.3, 0.0, 0.0))
+    assert fsm.state == FSMState.WALK
+    fsm.update(snap(t + 0.02, INIT, tilt_valid=False,
+                    locomotion_command=(0.3, 0.0, 0.0)), INIT)
+    assert fsm.state == FSMState.FAULT
+
+
+def test_dock_to_stand_blocked_without_valid_tilt():
+    fsm = make()
+    t = arm_to_ready(fsm, dock_confirmed=True)
+    assert fsm.state == FSMState.DOCK_DEMO
+    # DOCK_DEMO runs fine without an IMU; leaving it for STAND must not.
+    fsm.update(snap(t + 0.02, INIT, tilt_valid=False, offdock_confirmed=True), INIT)
+    assert fsm.state == FSMState.FAULT

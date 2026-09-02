@@ -242,3 +242,47 @@ def test_make_head_engine_none_derating_uses_full_envelope():
     d = abs(float(np.asarray(derated.evaluate(0.02, "walk", trg).head_command_offsets)[2]))
     f = abs(float(np.asarray(full.evaluate(0.02, "walk", trg).head_command_offsets)[2]))
     assert f > d  # full envelope allows a larger deflection than derated
+
+
+# --- eye events reach the device through _drive_show (regression for bug #2) --
+def test_eye_event_in_show_reaches_device_via_drive_show():
+    """_drive_show used to handle only 'sound' and 'projector' events and
+    silently drop 'eye' events, so clip eye cues (wide/blink/happy) never reached
+    the hardware. An 'eye' event authored in a clip's show_functions.events must
+    now be routed to the robot's set_eye_event."""
+    import types
+    from open_duck_anim import TickShow, DiscreteEvent
+
+    robot, c = make()
+    show = TickShow(
+        antenna_l=0.0, antenna_r=0.0, eyes=1,
+        events=[DiscreteEvent(frame=0, type="eye", value="wide")],
+    )
+    engine_out = types.SimpleNamespace(show=show)
+    out = types.SimpleNamespace(antennas=None, events_fired=[])
+    c._drive_show(engine_out, out)
+    # The eye cue reached the device and the event was recorded as fired.
+    assert robot.eye_event_history == ["wide"]
+    assert [ev.type for ev in out.events_fired] == ["eye"]
+
+
+def test_mixed_show_events_route_to_correct_channels():
+    """sound/projector/eye events each go to their own channel, in order."""
+    import types
+    from open_duck_anim import TickShow, DiscreteEvent
+
+    robot, c = make()
+    show = TickShow(
+        antenna_l=0.0, antenna_r=0.0, eyes=1,
+        events=[
+            DiscreteEvent(frame=0, type="sound", value="beep"),
+            DiscreteEvent(frame=0, type="eye", value="blink"),
+            DiscreteEvent(frame=0, type="projector", value="on"),
+        ],
+    )
+    engine_out = types.SimpleNamespace(show=show)
+    out = types.SimpleNamespace(antennas=None, events_fired=[])
+    c._drive_show(engine_out, out)
+    assert robot.sound_history == ["beep"]
+    assert robot.eye_event_history == ["blink"]
+    assert robot.projector_state is True

@@ -31,6 +31,13 @@ Tilt during OPERATIONAL modes uses a looser bound (``operational_tilt_rad``,
 default 0.15 rad = the plan's Phase-4 acceptance bound) so normal walking sway
 does not fault; the tight 0.10 rad guard governs the ARMING->operational
 handoff, when the robot should be quiescent.
+
+Balancing modes require **valid tilt sensing**: when the IMU is unavailable the
+on-robot adapter reports ``SensorSnapshot.tilt_valid = False`` (with a zero
+placeholder ``tilt_rad`` that must NOT be read as "upright"). The non-balancing
+DOCK_DEMO / head-only path may run with it False, but STAND and WALK cannot be
+entered — and are latched to FAULT if it goes False — so the robot never
+balances blind on a fake zero tilt.
 """
 
 from dataclasses import dataclass, field
@@ -292,6 +299,12 @@ class ModeFSM:
         if op.dock_confirmed:
             self._enter_operational(FSMState.DOCK_DEMO)
         elif op.offdock_confirmed:
+            # STAND is a balancing mode: never enter it without real tilt sensing.
+            # (With no IMU, snap.tilt_rad is a zero placeholder, not "upright".)
+            if not snap.tilt_valid:
+                self.to_fault("cannot enter STAND: no valid tilt/IMU "
+                              "(balance sensing required to leave the dock)")
+                return
             self._enter_operational(FSMState.STAND)
         # else: hold in ARMING (armed, waiting for a destination confirmation).
 
@@ -300,6 +313,11 @@ class ModeFSM:
         self._reset_guards(inside=False)
 
     def _step_stand(self, snap, commanded_targets, dt: float, op: OperatorInput) -> None:
+        # Balance sensing is mandatory in STAND: a lost/absent IMU makes tilt a
+        # meaningless zero, so latch FAULT rather than balance blind.
+        if not snap.tilt_valid:
+            self.to_fault("STAND requires valid tilt/IMU (balance sensing lost)")
+            return
         # Operational tilt fault (looser bound).
         if snap.tilt_rad > self.cfg.operational_tilt_rad:
             self.to_fault("tilt %.3f rad > operational bound %.3f"
@@ -317,6 +335,10 @@ class ModeFSM:
                 self._enter_operational(FSMState.DOCK_DEMO)
 
     def _step_walk(self, snap, op: OperatorInput) -> None:
+        # Balance sensing is mandatory in WALK too (see _step_stand).
+        if not snap.tilt_valid:
+            self.to_fault("WALK requires valid tilt/IMU (balance sensing lost)")
+            return
         if snap.tilt_rad > self.cfg.operational_tilt_rad:
             self.to_fault("tilt %.3f rad > operational bound %.3f"
                           % (snap.tilt_rad, self.cfg.operational_tilt_rad))
@@ -328,6 +350,11 @@ class ModeFSM:
     def _step_dock(self, snap, commanded_targets, dt: float, op: OperatorInput) -> None:
         # DOCK_DEMO -> STAND on off-dock confirm AND guards G.
         if op.offdock_confirmed:
+            # Leaving the dock enters a balancing mode; require real tilt sensing.
+            if not snap.tilt_valid:
+                self.to_fault("cannot leave dock for STAND: no valid tilt/IMU "
+                              "(balance sensing required)")
+                return
             if self._guards_hold(snap, commanded_targets, dt,
                                  tilt_thr=self.cfg.arming_tilt_rad,
                                  require_both_feet=True):
