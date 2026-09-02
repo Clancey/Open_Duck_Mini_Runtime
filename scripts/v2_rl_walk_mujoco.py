@@ -35,6 +35,9 @@ class RLWalk:
         save_obs=False,
         replay_obs=None,
         cutoff_frequency=None,
+        head_animation=False,
+        animation_clip=None,
+        animation_derating=0.5,
     ):
 
         self.duck_config = DuckConfig(config_json_path=duck_config_path)
@@ -120,6 +123,37 @@ class RLWalk:
         if self.duck_config.antennas:
             self.antennas = Antennas()
 
+        # --- Phase 4: optional additive head animation overlay ---------------
+        # While the RL policy owns the legs (STAND/WALK), the head is driven by
+        # the deployed additive path (see the head_motor_targets lines in run()).
+        # When enabled, an open_duck_anim.Engine is evaluated EXACTLY ONCE per
+        # control tick from the SAME loop clock (no second timer thread — a
+        # separate animation clock would drift against the policy clock), and its
+        # envelope-clamped head offsets are routed into last_commands[3:7] so
+        # they flow through that existing additive path. Legs are never touched.
+        self.head_animation = head_animation
+        self.anim_engine = None
+        self.anim_show = None
+        self._anim_t0 = None
+        if self.head_animation:
+            from mini_bdx_runtime.anim.controller import make_head_engine
+            from open_duck_anim import Triggers as _AnimTriggers, load_clip as _load_clip
+
+            self._AnimTriggers = _AnimTriggers
+            bg = None
+            if animation_clip is not None:
+                bg = _load_clip(animation_clip)
+            # Head output ALWAYS passes the measured safety envelope; derated
+            # (x0.5 by default) for early hardware trials — relax as data accrues.
+            self.anim_engine = make_head_engine(
+                envelope_derating=animation_derating, background_clip=bg
+            )
+            self._anim_t0 = time.monotonic()
+            print(
+                f"[anim] head animation ENABLED (derating={animation_derating}, "
+                f"clip={'<background>' if bg is None else animation_clip})"
+            )
+
     def get_obs(self):
 
         imu_data = self.imu.get_data()
@@ -170,6 +204,29 @@ class RLWalk:
         )
 
         return obs
+
+    def _drive_anim_show(self, show):
+        """Route the animation engine's show tick to the expression hardware.
+
+        Antennas are driven ONLY from ``show`` (never the joint array) via the
+        existing ``antennas.py`` PWM path (D13 left +1 / D12 right -1). Discrete
+        sound/projector events fire exactly once (the engine edge-triggers them).
+        Eyes keep their existing autonomous blink thread in the RL loop.
+        """
+        if show is None:
+            return
+        if self.duck_config.antennas:
+            # show.antenna_l / antenna_r are already per-side normalised [-1, 1]
+            # with the clip's left=+1 / right=-1 calibration baked in.
+            self.antennas.set_position_left(float(show.antenna_l))
+            self.antennas.set_position_right(float(show.antenna_r))
+        for ev in show.events:
+            if ev.type == "sound" and self.duck_config.speaker:
+                self.sounds.play(ev.value)
+            elif ev.type == "projector" and self.duck_config.projector:
+                want_on = str(ev.value).lower() in ("on", "1", "true")
+                if want_on != self.projector.on:
+                    self.projector.switch()
 
     def start(self):
         kps = [self.pid[0]] * 14
@@ -250,6 +307,23 @@ class RLWalk:
                     time.sleep(0.1)
                     continue
 
+                # --- Phase 4: additive head animation (evaluate engine ONCE) ---
+                # Route envelope-clamped head offsets into last_commands[3:7] so
+                # they (a) enter the obs the policy sees and (b) flow through the
+                # deployed additive head path below. Legs are NEVER touched here.
+                if self.anim_engine is not None:
+                    t_anim = time.monotonic() - self._anim_t0
+                    eng = self.anim_engine.evaluate(
+                        t_anim, "walk", self._AnimTriggers()
+                    )
+                    ho = eng.head_command_offsets  # (4,) already envelope-clamped
+                    for k in range(4):
+                        self.last_commands[3 + k] = (
+                            float(self.last_commands[3 + k]) + float(ho[k])
+                        )
+                    self.anim_show = eng.show
+                    self._drive_anim_show(eng.show)
+
                 obs = self.get_obs()
                 if obs is None:
                     continue
@@ -289,14 +363,6 @@ class RLWalk:
 
                 self.motor_targets = self.init_pos + action * self.action_scale
 
-                # self.motor_targets = np.clip(
-                #     self.motor_targets,
-                #     self.prev_motor_targets
-                #     - self.max_motor_velocity * (1 / self.control_freq),  # control dt
-                #     self.prev_motor_targets
-                #     + self.max_motor_velocity * (1 / self.control_freq),  # control dt
-                # )
-
                 if self.action_filter is not None:
                     self.action_filter.push(self.motor_targets)
                     filtered_motor_targets = self.action_filter.get_filtered_action()
@@ -305,10 +371,25 @@ class RLWalk:
                     ):  # give time to the filter to stabilize
                         self.motor_targets = filtered_motor_targets
 
-                self.prev_motor_targets = self.motor_targets.copy()
-
+                # Deployed additive head path (permanent architecture): the
+                # walking policy does NOT actuate the head; the head is commanded
+                # additively from last_commands[3:7] (operator aim + any Phase 4
+                # animation overlay). Keep these two lines.
                 head_motor_targets = self.last_commands[3:] + self.motor_targets[5:9]
                 self.motor_targets[5:9] = head_motor_targets
+
+                # Phase 4 SAFETY: re-enable the max joint velocity clip, applied
+                # to the FINAL 14-DOF bus targets (AFTER the additive head), not
+                # to the animation commands — this is where the plan (§6.5) says
+                # it belongs so no single tick can slew any joint faster than
+                # max_motor_velocity regardless of policy or animation output.
+                dt = 1.0 / self.control_freq
+                self.motor_targets = np.clip(
+                    self.motor_targets,
+                    self.prev_motor_targets - self.max_motor_velocity * dt,
+                    self.prev_motor_targets + self.max_motor_velocity * dt,
+                )
+                self.prev_motor_targets = self.motor_targets.copy()
 
                 action_dict = make_action_dict(
                     self.motor_targets, list(self.hwi.joints.keys())
@@ -379,6 +460,27 @@ if __name__ == "__main__":
         help="replay the observations from a previous run (can be from the robot or from mujoco)",
     )
     parser.add_argument("--cutoff_frequency", type=float, default=None)
+    parser.add_argument(
+        "--head_animation",
+        action="store_true",
+        default=False,
+        help="Phase 4: overlay open_duck_anim head animation onto the additive "
+        "head path while walking/standing (envelope-clamped, legs untouched).",
+    )
+    parser.add_argument(
+        "--animation_clip",
+        type=str,
+        default=None,
+        help="Path to a .duckanim clip used as the always-on background head "
+        "loop when --head_animation is set (default: engine idle background).",
+    )
+    parser.add_argument(
+        "--animation_derating",
+        type=float,
+        default=0.5,
+        help="Head safety-envelope derating for --head_animation (0.5 = plan "
+        "§6.5 default for early hardware trials; 1.0 = full measured envelope).",
+    )
 
     args = parser.parse_args()
     pid = [args.p, args.i, args.d]
@@ -395,6 +497,9 @@ if __name__ == "__main__":
         save_obs=args.save_obs,
         replay_obs=args.replay_obs,
         cutoff_frequency=args.cutoff_frequency,
+        head_animation=args.head_animation,
+        animation_clip=args.animation_clip,
+        animation_derating=args.animation_derating,
     )
     print("Done instantiating RLWalk")
     rl_walk.run()
