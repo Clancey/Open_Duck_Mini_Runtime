@@ -124,6 +124,9 @@ def main():
     ap.add_argument("--no-sounds", action="store_true")
     ap.add_argument("--no-projector", action="store_true")
     ap.add_argument("--no-eyes", action="store_true")
+    ap.add_argument("--no-antennas", action="store_true",
+                    help="never energise the antenna PWM (they otherwise move "
+                         "only once an animation articulates them)")
     ap.add_argument("--dry-run", action="store_true",
                     help="use the mock robot (no hardware) to smoke-test the loop")
     args = ap.parse_args()
@@ -156,7 +159,7 @@ def main():
         robot = RealRobot(
             usb_port=args.usb_port, sound_directory=args.sound_dir,
             enable_sounds=not args.no_sounds, enable_projector=not args.no_projector,
-            enable_eyes=not args.no_eyes,
+            enable_eyes=not args.no_eyes, enable_antennas=not args.no_antennas,
         )
         robot.connect()
 

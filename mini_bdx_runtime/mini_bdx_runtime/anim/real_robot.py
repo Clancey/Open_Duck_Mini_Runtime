@@ -12,7 +12,14 @@ Mapping to the existing runtime devices (unchanged, we only adapt them):
 * tilt                -> ``raw_imu.Imu`` accelerometer gravity estimate (the
   runtime IMU exposes only gyro+accel, no orientation quaternion, so we derive
   the tilt-from-vertical angle here and document it)
-* antennas            -> ``antennas.Antennas`` (PWM D13 left +1 / D12 right -1)
+* antennas            -> ``antennas.Antennas`` (PWM D13 left +1 / D12 right -1).
+  ``Antennas()`` drives the PWM pins the instant it is constructed, so it is
+  **not** built in ``connect``. It is created lazily the first time a genuine
+  (non-neutral) antenna command is issued, which only happens once the FSM has
+  left ``DISARMED`` and an animation actually articulates the antennas. Merely
+  connecting — or holding in ``BOOT``/``DISARMED``/``FAULT`` — never energises
+  the antenna pins. Pass ``enable_antennas=False`` (or ``connect(actuate=False)``
+  for a read-only inspection attach) to keep the antennas dark unconditionally.
 * eyes                -> ``eyes.Eyes`` (its auto-blink thread is stopped so the
   animation eye track has exclusive control)
 * sounds              -> ``sounds.Sounds``
@@ -62,13 +69,19 @@ class RealRobot(RobotInterface):
 
     def __init__(self, duck_config=None, usb_port: str = "/dev/ttyACM0",
                  sound_directory: str = "./", enable_sounds: bool = True,
-                 enable_projector: bool = True, enable_eyes: bool = True):
+                 enable_projector: bool = True, enable_eyes: bool = True,
+                 enable_antennas: bool = True):
         self.usb_port = usb_port
         self._duck_config = duck_config
         self._sound_directory = sound_directory
         self._enable_sounds = enable_sounds
         self._enable_projector = enable_projector
         self._enable_eyes = enable_eyes
+        self._enable_antennas = enable_antennas
+        # Whether this connection is allowed to energise motion hardware. Set by
+        # connect(actuate=...). Defaults to False until connect() runs so a
+        # freshly-constructed (never connected) adapter never actuates.
+        self._actuate = False
 
         self.hwi = None
         self.imu = None
@@ -78,17 +91,32 @@ class RealRobot(RobotInterface):
         self.projector = None
         self._connected = False
 
-    def connect(self) -> None:
-        """Lazily import and open every device. Raises if hardware is absent."""
+    def connect(self, actuate: bool = True) -> None:
+        """Lazily import and open every device. Raises if hardware is absent.
+
+        Opening the bus (``HWI``) and the IMU is **read-capable but passive**:
+        the servos come up torque-off and ``connect`` never calls ``turn_on`` /
+        ``set_gains`` / ``set_position_all``, so no joint is energised here —
+        torque is applied later, explicitly, by the ARMING ramp. The antennas
+        are likewise *not* constructed now (``Antennas()`` would drive its PWM
+        pins immediately); they are created lazily on the first real command.
+
+        Pass ``actuate=False`` to attach for read-only inspection: no motion
+        hardware is energised at all (the antennas stay dark even if a stray
+        command arrives). ``actuate=True`` (the default) still does not move
+        anything at connect time; it only permits the deferred antenna init to
+        happen later when an animation actually articulates them.
+        """
         from mini_bdx_runtime.rustypot_position_hwi import HWI
         from mini_bdx_runtime.raw_imu import Imu
-        from mini_bdx_runtime.antennas import Antennas
         from mini_bdx_runtime.duck_config import DuckConfig
 
+        self._actuate = bool(actuate)
         cfg = self._duck_config or DuckConfig()
         self.hwi = HWI(cfg, self.usb_port)
         self.imu = Imu(sampling_freq=50)
-        self.antennas = Antennas()
+        # NOTE: antennas are intentionally NOT constructed here (see class /
+        # set_antennas docstrings) — building Antennas() twitches the servos.
         if self._enable_eyes:
             from mini_bdx_runtime.eyes import Eyes
             self.eyes = Eyes()
@@ -152,8 +180,31 @@ class RealRobot(RobotInterface):
     def torque_off(self) -> None:
         self.hwi.turn_off()
 
+    def _ensure_antennas(self, left_norm: float, right_norm: float) -> bool:
+        """Lazily energise the antenna PWM and report whether it is ready.
+
+        The first genuine (non-neutral) command constructs :class:`Antennas`
+        (which drives the pins) — but only if antennas are enabled and this
+        connection was opened with actuation allowed. A neutral ``(0, 0)``
+        command on an un-energised antenna is already satisfied (the servo is
+        passive), so it never powers the pins; that is exactly the "show off"
+        request the controller issues in BOOT/DISARMED/FAULT via
+        ``shutdown_show``. The antennas therefore first move only once the FSM
+        has left DISARMED and an animation actually articulates them, matching
+        the explicit-consent startup design.
+        """
+        if self.antennas is not None:
+            return True
+        if not (self._enable_antennas and self._actuate):
+            return False
+        if left_norm == 0.0 and right_norm == 0.0:
+            return False
+        from mini_bdx_runtime.antennas import Antennas
+        self.antennas = Antennas()
+        return True
+
     def set_antennas(self, left_norm: float, right_norm: float) -> None:
-        if self.antennas is None:
+        if not self._ensure_antennas(left_norm, right_norm):
             return
         self.antennas.set_position_left(float(left_norm))
         self.antennas.set_position_right(float(right_norm))
