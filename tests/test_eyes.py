@@ -79,6 +79,19 @@ def _darks_between(pin, t0, t1):
     return sum(1 for (ts, v) in pin.transitions if t0 < ts <= t1 and v is False)
 
 
+def _max_dark_dwell(pin):
+    """Longest interval the pin stayed dark (a False followed by a True)."""
+    best = 0.0
+    trans = pin.transitions
+    for i in range(len(trans) - 1):
+        ts, v = trans[i]
+        if v is False:
+            nts, nv = trans[i + 1]
+            if nv is True:
+                best = max(best, nts - ts)
+    return best
+
+
 def test_eyes_lit_at_baseline(eyes_module):
     eyes_mod, left, right = eyes_module
     # Long idle interval so no idle blink fires during the check.
@@ -148,5 +161,108 @@ def test_authored_falling_edge_triggers_blink(eyes_module):
         time.sleep(0.15)
         assert _darks_between(left, t1, time.monotonic()) >= 1
         assert left.value is True        # not left dark
+    finally:
+        e.stop()
+
+
+# --- sustained wide/fear mode: hold, suppress blinking, relief burst on release
+def test_wide_hold_suppresses_idle_blink_then_release_bursts(eyes_module):
+    """enter_wide_hold holds the eyes wide with idle blinking fully suppressed;
+    release_wide_hold ends it with a burst of relief blinks."""
+    eyes_mod, left, right = eyes_module
+    # Fast idle (0.05 s) would flick ~8x during the hold, absent suppression.
+    e = eyes_mod.Eyes(blink_duration=0.02, min_interval=0.05, max_interval=0.05,
+                      double_blink_prob=0.0, double_gap=0.05, relief_blinks=3)
+    try:
+        time.sleep(0.05)
+        t_hold = time.monotonic()
+        e.enter_wide_hold(timeout=5.0)
+        time.sleep(0.4)
+        # Frightened things don't blink: zero dark flicks across the whole hold.
+        assert _darks_between(left, t_hold, time.monotonic()) == 0
+        assert left.value is True
+        assert e.is_wide_held() is True
+
+        t_rel = time.monotonic()
+        e.release_wide_hold()
+        time.sleep(0.35)
+        # Release produces a burst of relief blinks (not a single flick).
+        assert _darks_between(left, t_rel, t_rel + 0.35) >= 2
+        assert e.is_wide_held() is False
+    finally:
+        e.stop()
+
+
+def test_wide_hold_safety_timeout_auto_releases(eyes_module):
+    """A held wide/fear state must self-release after its safety timeout so a
+    cancelled clip (whose release event never fires) cannot strand the eyes."""
+    eyes_mod, left, right = eyes_module
+    e = eyes_mod.Eyes(blink_duration=0.02, min_interval=2.0, max_interval=2.0,
+                      double_blink_prob=0.0, double_gap=0.05, relief_blinks=2)
+    try:
+        time.sleep(0.05)
+        t0 = time.monotonic()
+        e.enter_wide_hold(timeout=0.2)   # backstop fires at ~0.2 s
+        time.sleep(0.15)                 # still inside the hold: no blinking
+        assert _darks_between(left, t0, time.monotonic()) == 0
+        assert e.is_wide_held() is True
+        time.sleep(0.5)                  # past the timeout -> auto-release
+        assert e.is_wide_held() is False
+        # Blinking resumed after the timeout (the relief burst; idle is 2 s off).
+        assert _darks_between(left, t0 + 0.2, time.monotonic()) >= 1
+        assert left.value is True
+    finally:
+        e.stop()
+
+
+def test_wide_hold_suppresses_authored_blinks(eyes_module):
+    """Per-frame authored eye edges must not blink through the fear hold."""
+    eyes_mod, left, right = eyes_module
+    e = eyes_mod.Eyes(blink_duration=0.02, min_interval=5.0, max_interval=5.0,
+                      double_blink_prob=0.0)
+    try:
+        time.sleep(0.05)
+        e.enter_wide_hold(timeout=5.0)
+        t0 = time.monotonic()
+        for _ in range(3):               # three authored 1->0 blink edges
+            e.note_authored(0)
+            e.note_authored(1)
+            time.sleep(0.03)
+        time.sleep(0.1)
+        assert _darks_between(left, t0, time.monotonic()) == 0
+        assert left.value is True
+    finally:
+        e.stop()
+
+
+def test_slow_blink_dwell_longer_than_idle_flick(eyes_module):
+    """slow_blink is one long heavy lid close/open: its dark dwell is far longer
+    than the crisp idle flick (the only honest way to say 'sleepy' on on/off
+    LEDs is via timing)."""
+    eyes_mod, left, right = eyes_module
+    e = eyes_mod.Eyes(blink_duration=0.02, min_interval=5.0, max_interval=5.0,
+                      double_blink_prob=0.0)
+    try:
+        time.sleep(0.05)
+        e.slow_blink(close=0.3)
+        time.sleep(0.45)
+        assert _max_dark_dwell(left) >= 0.2      # >> the 0.02 s idle flick
+        assert left.value is True
+    finally:
+        e.stop()
+
+
+def test_release_without_hold_is_noop(eyes_module):
+    """release_wide_hold with no active hold must not fire a spurious burst."""
+    eyes_mod, left, right = eyes_module
+    e = eyes_mod.Eyes(blink_duration=0.02, min_interval=5.0, max_interval=5.0,
+                      double_blink_prob=0.0)
+    try:
+        time.sleep(0.05)
+        t0 = time.monotonic()
+        e.release_wide_hold()
+        time.sleep(0.15)
+        assert _darks_between(left, t0, time.monotonic()) == 0
+        assert e.is_wide_held() is False
     finally:
         e.stop()

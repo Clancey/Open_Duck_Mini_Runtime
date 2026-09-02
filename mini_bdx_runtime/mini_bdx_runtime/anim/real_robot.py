@@ -240,18 +240,39 @@ class RealRobot(RobotInterface):
     def set_eye_event(self, value: str) -> None:
         """Apply a discrete expressive eye cue from a clip show event.
 
-        Maps the authored cue vocabulary onto the on/off LED hardware:
-        ``blink`` -> one blink, ``happy`` -> quick double-blink, ``wide`` /
-        ``startle`` -> hold the eyes wide (suppress blinking) briefly. Unknown
-        cues fall back to a single blink."""
+        Maps the authored cue vocabulary onto the on/off LED hardware (two binary
+        channels; no PWM/RGB/eyelid radius, so aperture cues can't be honest):
+
+        * ``blink`` -> one blink; ``happy`` -> quick double-blink.
+        * ``wide`` / ``startle`` -> a brief one-shot wide hold.
+        * ``fear`` / ``wide_hold`` / ``cower`` -> *enter* the sustained wide/fear
+          state (eyes wide, idle blinking suppressed) until released.
+        * ``release`` / ``relief`` / ``calm`` -> *release* it with a relief burst.
+        * ``slow_blink`` / ``sleepy`` -> one long, heavy lid close/open.
+        * ``squint`` -> a partial aperture, which binary LEDs cannot express;
+          intentionally a no-op rather than a fake blink.
+
+        Unknown cues fall back to a single blink."""
         if self.eyes is None:
             return
         v = str(value).lower()
         try:
-            if v in ("wide", "startle", "alert", "open"):
+            if v in ("fear", "wide_hold", "cower", "afraid"):
+                self.eyes.enter_wide_hold()
+            elif v in ("release", "wide_release", "fear_release", "relief",
+                       "calm", "unhold"):
+                self.eyes.release_wide_hold()
+            elif v in ("slow_blink", "slow", "sleepy", "heavy_blink"):
+                self.eyes.slow_blink()
+            elif v in ("wide", "startle", "alert", "open"):
                 self.eyes.hold_open(1.0)
             elif v in ("happy", "double", "double_blink"):
                 self.eyes.double_blink()
+            elif v == "squint":
+                # Squint is a partial aperture; these eyes are binary on/off LEDs
+                # with no radius/PWM control, so it cannot be represented
+                # honestly. Deliberately a no-op (not a misleading blink).
+                pass
             elif v in ("blink", "close", "closed"):
                 self.eyes.blink()
             else:
@@ -281,6 +302,14 @@ class RealRobot(RobotInterface):
     def shutdown_show(self) -> None:
         self.set_antennas(0.0, 0.0)
         self.set_projector(False)
+        # Failsafe: FAULT / e-stop / BOOT must always release a sustained
+        # wide/fear hold so the eyes can never be stranded wide. Silent release
+        # (no relief burst) — a fault is not a moment for expressive flair.
+        if self.eyes is not None:
+            try:
+                self.eyes.release_wide_hold(relief_blinks=0)
+            except Exception:
+                pass
 
     def close(self) -> None:
         for dev, meth in ((self.antennas, "stop"), (self.eyes, "stop"),

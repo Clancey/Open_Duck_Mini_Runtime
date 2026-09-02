@@ -94,6 +94,7 @@ class _SpyEyes:
     def __init__(self):
         self.usable = True
         self.stopped = False
+        self.wide_held = False       # sustained wide/fear state
         self.authored = []          # note_authored() history (per-frame channel)
         self.cues = []              # expressive cue history (blink/double/hold)
 
@@ -116,6 +117,20 @@ class _SpyEyes:
     def hold_open(self, seconds=1.0):
         self._require_usable()
         self.cues.append(("hold_open", float(seconds)))
+
+    def slow_blink(self, n=1, close=None):
+        self._require_usable()
+        self.cues.append(("slow_blink", int(n)))
+
+    def enter_wide_hold(self, timeout=None):
+        self._require_usable()
+        self.cues.append(("enter_wide_hold", timeout))
+        self.wide_held = True
+
+    def release_wide_hold(self, relief_blinks=None):
+        self._require_usable()
+        self.cues.append(("release_wide_hold", relief_blinks))
+        self.wide_held = False
 
     def stop(self):
         self.stopped = True
@@ -251,6 +266,42 @@ def test_set_eye_event_maps_cues_to_hardware(fake_hw):
         ("double_blink", None),
         ("blink", 1),
     ]
+
+
+def test_set_eye_event_fear_enters_and_releases_sustained_hold(fake_hw):
+    """'fear'/'wide_hold' enters the sustained wide state; 'release'/'relief'
+    exits it. This is a state, not a one-shot hold_open."""
+    robot = _make()
+    robot.connect()
+    robot.set_eye_event("fear")
+    assert robot.eyes.wide_held is True
+    robot.set_eye_event("release")
+    assert robot.eyes.wide_held is False
+    assert [c[0] for c in robot.eyes.cues] == [
+        "enter_wide_hold", "release_wide_hold",
+    ]
+
+
+def test_set_eye_event_slow_blink_and_squint_no_op(fake_hw):
+    """slow_blink reaches the device; squint is a no-op (binary LEDs can't do a
+    partial aperture, so it must not fake a blink)."""
+    robot = _make()
+    robot.connect()
+    robot.set_eye_event("slow_blink")
+    robot.set_eye_event("squint")
+    assert robot.eyes.cues == [("slow_blink", 1)]
+
+
+def test_shutdown_show_releases_wide_hold_failsafe(fake_hw):
+    """FAULT / e-stop / BOOT go through shutdown_show, which MUST release a held
+    wide/fear state so the eyes can never be stranded wide. Silent release."""
+    robot = _make()
+    robot.connect()
+    robot.set_eye_event("fear")
+    assert robot.eyes.wide_held is True
+    robot.shutdown_show()
+    assert robot.eyes.wide_held is False
+    assert ("release_wide_hold", 0) in robot.eyes.cues
 
 
 # --- IMU optional for dock/head, but tilt marked invalid (safety) -----------
